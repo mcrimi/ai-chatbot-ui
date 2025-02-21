@@ -74,7 +74,7 @@ st.markdown("""
 
 st.image("https://www.projectpathways.org/assets/images/common/logo/logo-color.svg", width=100)
 # Show title and description.
-st.title("✨Hi, I'm a very rudimentary version Segment Explorer AI Assistant✨")
+st.title("✨Hi, I'm a very rudimentary version of the Segment Explorer AI Assistant✨")
 st.write(
     "This is a simple demo of a conversational AI assistant that can answer questions based on a the Senegal Segmentation Data and the Pathways Methodology"
 )

@@ -62,7 +62,7 @@ st.set_page_config(
 st.markdown("""
     <style>
         .stApp {
-            background-color: #0E1117;
+            background-color: #0E1117;pi
             color: #FAFAFA;
         }
         .stButton>button {
@@ -74,9 +74,9 @@ st.markdown("""
 
 st.image("https://www.projectpathways.org/assets/images/common/logo/logo-color.svg", width=100)
 # Show title and description.
-st.title("✨ Hi I'm a very rudimentary version of PATTY, your Segment Explorer AI assistant")
+st.title("✨Hi, I'm a very rudimentary version Segment Explorer AI Assistant✨")
 st.write(
-    "This is a simple demo of a conversational AI assistant that can answer questions based on a the Senegal Segmentation Data "
+    "This is a simple demo of a conversational AI assistant that can answer questions based on a the Senegal Segmentation Data and the Pathways Methodology"
 )
 
 with st.form("my_form"):

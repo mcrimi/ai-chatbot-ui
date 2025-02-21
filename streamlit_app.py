@@ -11,9 +11,9 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_pinecone import PineconeVectorStore
 
 #Keys
-os.environ["PINECONE_API_KEY"] = "pcsk_4E5oQG_A8ZynYUqYSEwBeM6xghNRBQV7685AZ54JdvmC1oCafdeUmFAbBBLoqEDWcMGLKW"
-os.environ["OPENAI_API_KEY"] = "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"
-os.environ["LANGCHAIN_API_KEY"] = "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"
+os.environ["PINECONE_API_KEY"] = st.secrets["PINECONE_API_KEY"]
+os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
+os.environ["LANGCHAIN_API_KEY"] = st.secrets["LANGCHAIN_API_KEY"]
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
 os.environ["LANGSMITH_PROJECT"] = "pathways-ai-assistant"
 

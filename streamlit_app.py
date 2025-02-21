@@ -1,56 +1,94 @@
 import streamlit as st
 from openai import OpenAI
+import os
+from langchain.chat_models import ChatOpenAI
+from langchain import hub
+from langchain.docstore.document import Document
+from langsmith import traceable
+from typing_extensions import List, TypedDict
+from langgraph.graph import START, StateGraph
+from langchain_openai import OpenAIEmbeddings
+from langchain_pinecone import PineconeVectorStore
 
-# Show title and description.
-st.title("💬 Chatbot")
-st.write(
-    "This is a simple chatbot that uses OpenAI's GPT-3.5 model to generate responses. "
-    "To use this app, you need to provide an OpenAI API key, which you can get [here](https://platform.openai.com/account/api-keys). "
-    "You can also learn how to build this app step by step by [following our tutorial](https://docs.streamlit.io/develop/tutorials/llms/build-conversational-apps)."
+#Keys
+os.environ["PINECONE_API_KEY"] = "pcsk_4E5oQG_A8ZynYUqYSEwBeM6xghNRBQV7685AZ54JdvmC1oCafdeUmFAbBBLoqEDWcMGLKW"
+os.environ["OPENAI_API_KEY"] = "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"
+os.environ["LANGCHAIN_API_KEY"] = "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"
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+os.environ["LANGSMITH_PROJECT"] = "pathways-ai-assistant"
+
+#Constants
+PINECONE_INDEX_NAME = "senegal-metrics-v1-1"
+EMBEDDING_MODEL = "text-embedding-3-large"
+
+
+class State(TypedDict):
+    question: str
+    context: List[Document]
+    answer: str
+
+@traceable
+def retrieve(state: State):
+    embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
+    vectorstore = PineconeVectorStore(
+        index_name=PINECONE_INDEX_NAME, embedding=embeddings
+    )
+    retrieved_docs = vectorstore.similarity_search(state["question"])
+    return {"context": retrieved_docs}
+
+@traceable
+def generate(state: State):
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+    prompt = hub.pull("response-generator")
+    docs_content = "\n\n".join(doc.page_content for doc in state["context"])
+    messages = prompt.invoke({"question": state["question"], "context": docs_content})
+    llm = ChatOpenAI(model_name="gpt-4", temperature=0.5, openai_api_key=OPENAI_API_KEY)
+    response = llm.invoke(messages)
+    return {"answer": response.content}
+
+st.set_page_config(
+    page_title="Segment Explorer AI Assistant",
+    page_icon="🤖",
+    layout="wide",
+    initial_sidebar_state="expanded",
+    menu_items={
+        'Get Help': 'https://docs.streamlit.io/',
+        'Report a bug': 'https://github.com/streamlit/streamlit/issues',
+        'About': "### Segment Explorer AI Assistant - Powered by Streamlit"
+    }
 )
 
-# Ask user for their OpenAI API key via `st.text_input`.
-# Alternatively, you can store the API key in `./.streamlit/secrets.toml` and access it
-# via `st.secrets`, see https://docs.streamlit.io/develop/concepts/connections/secrets-management
-openai_api_key = st.text_input("OpenAI API Key", type="password")
-if not openai_api_key:
-    st.info("Please add your OpenAI API key to continue.", icon="🗝️")
-else:
+# Custom CSS for additional styling
+st.markdown("""
+    <style>
+        .stApp {
+            background-color: #0E1117;
+            color: #FAFAFA;
+        }
+        .stButton>button {
+            color: white;
+            background-color: #1E90FF;
+        }
+    </style>
+""", unsafe_allow_html=True)
 
-    # Create an OpenAI client.
-    client = OpenAI(api_key=openai_api_key)
+st.image("https://www.projectpathways.org/assets/images/common/logo/logo-color.svg", width=100)
+# Show title and description.
+st.title("✨ Hi I'm a very rudimentary version of PATTY, your Segment Explorer AI assistant")
+st.write(
+    "This is a simple demo of a conversational AI assistant that can answer questions based on a the Senegal Segmentation Data "
+)
 
-    # Create a session state variable to store the chat messages. This ensures that the
-    # messages persist across reruns.
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+with st.form("my_form"):
+    text = st.text_area(
+        "Enter your question:"
+    )
+    submitted = st.form_submit_button("Submit")
+    if submitted:
+        graph_builder = StateGraph(State).add_sequence([retrieve, generate])
+        graph_builder.add_edge(START, "retrieve")
+        graph = graph_builder.compile()
 
-    # Display the existing chat messages via `st.chat_message`.
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-
-    # Create a chat input field to allow the user to enter a message. This will display
-    # automatically at the bottom of the page.
-    if prompt := st.chat_input("What is up?"):
-
-        # Store and display the current prompt.
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
-
-        # Generate a response using the OpenAI API.
-        stream = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": m["role"], "content": m["content"]}
-                for m in st.session_state.messages
-            ],
-            stream=True,
-        )
-
-        # Stream the response to the chat using `st.write_stream`, then store it in 
-        # session state.
-        with st.chat_message("assistant"):
-            response = st.write_stream(stream)
-        st.session_state.messages.append({"role": "assistant", "content": response})
+        result = graph.invoke({"question": text})
+        answer = result["answer"]
+        st.info(answer)

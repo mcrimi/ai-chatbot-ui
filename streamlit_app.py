@@ -54,23 +54,9 @@ st.set_page_config(
     menu_items={
         'Get Help': 'https://docs.streamlit.io/',
         'Report a bug': 'https://github.com/streamlit/streamlit/issues',
-        'About': "### Segment Explorer AI Assistant - Powered by Streamlit"
+        'About': "### Segment Explorer AI Assistant"
     }
 )
-
-# Custom CSS for additional styling
-st.markdown("""
-    <style>
-        .stApp {
-            background-color: #0E1117;pi
-            color: #FAFAFA;
-        }
-        .stButton>button {
-            color: white;
-            background-color: #1E90FF;
-        }
-    </style>
-""", unsafe_allow_html=True)
 
 st.image("https://www.projectpathways.org/assets/images/common/logo/logo-color.svg", width=100)
 # Show title and description.

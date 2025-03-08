@@ -13,6 +13,7 @@ from langchain.memory import ConversationBufferMemory
 from langchain.schema import AIMessage, HumanMessage, SystemMessage
 from langchain.callbacks.base import BaseCallbackHandler
 import time
+import pinecone
 
 #Keys
 os.environ["PINECONE_API_KEY"] = st.secrets["PINECONE_API_KEY"]
@@ -22,7 +23,7 @@ os.environ["LANGCHAIN_TRACING_V2"] = "true"
 os.environ["LANGSMITH_PROJECT"] = "pathways-ai-assistant"
 
 #Constants
-PINECONE_INDEX_NAME = "senegal-metrics-v1-1"
+DEFAULT_PINECONE_INDEX = "senegal-metrics-v1-1"
 EMBEDDING_MODEL = "text-embedding-3-large"
 SYSTEM_PROMPT = """You are an AI assistant specialized in Senegal Segmentation Data and the Pathways Methodology. 
 Answer questions based on the provided context. If you don't know the answer, say so instead of making up information."""
@@ -46,14 +47,47 @@ class State(TypedDict):
     answer: Optional[str]
 
 
+def get_available_indexes():
+    """Retrieve all available Pinecone indexes."""
+    try:
+        # Initialize Pinecone with newer SDK syntax
+        pc = pinecone.Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+        
+        # List all indexes
+        indexes = [index.name for index in pc.list_indexes()]
+        
+        # Make sure we have at least the default index in the list
+        if not indexes:
+            indexes = [DEFAULT_PINECONE_INDEX]
+        elif DEFAULT_PINECONE_INDEX not in indexes:
+            indexes.append(DEFAULT_PINECONE_INDEX)
+            
+        return indexes
+    except Exception as e:
+        st.error(f"Error retrieving Pinecone indexes: {e}")
+        return [DEFAULT_PINECONE_INDEX]
+
+
 @traceable
 def retrieve(state: State):
+    # Get the currently selected index from session state
+    current_index = st.session_state.get("selected_index", DEFAULT_PINECONE_INDEX)
+    
     embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
-    vectorstore = PineconeVectorStore(
-        index_name=PINECONE_INDEX_NAME, embedding=embeddings
-    )
-    retrieved_docs = vectorstore.similarity_search(state["question"])
-    return {"context": retrieved_docs}
+    
+    try:
+        # Initialize Pinecone with newer SDK syntax
+        pc = pinecone.Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+        index = pc.Index(current_index)
+        
+        # Create vector store using the index
+        vectorstore = PineconeVectorStore(index=index, embedding=embeddings)
+        
+        retrieved_docs = vectorstore.similarity_search(state["question"])
+        return {"context": retrieved_docs}
+    except Exception as e:
+        st.error(f"Error retrieving documents from index '{current_index}': {e}")
+        return {"context": [Document(page_content=f"Error retrieving documents: {e}")]}
 
 
 @traceable
@@ -107,6 +141,10 @@ def generate(state: State):
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+# Initialize session state for selected index
+if "selected_index" not in st.session_state:
+    st.session_state.selected_index = DEFAULT_PINECONE_INDEX
+
 st.set_page_config(
     page_title="Segment Explorer AI Assistant",
     page_icon="🤖",
@@ -118,6 +156,27 @@ st.set_page_config(
         'About': "### Segment Explorer AI Assistant"
     }
 )
+
+# Sidebar with index selection
+st.sidebar.title("Configuration")
+available_indexes = get_available_indexes()
+selected_index = st.sidebar.selectbox(
+    "Select Pinecone Index",
+    options=available_indexes,
+    index=available_indexes.index(st.session_state.selected_index) if st.session_state.selected_index in available_indexes else 0
+)
+
+# Update session state if index changed
+if selected_index != st.session_state.selected_index:
+    st.session_state.selected_index = selected_index
+    # Clear chat history when changing index
+    st.session_state.messages = []
+    st.sidebar.success(f"Switched to index: {selected_index}. Chat history cleared.")
+
+# Add a separate button to clear chat history
+if st.sidebar.button("Clear Chat History"):
+    st.session_state.messages = []
+    st.sidebar.success("Chat history cleared.")
 
 st.image("https://www.projectpathways.org/assets/images/common/logo/logo-color.svg", width=100)
 # Show title and description.

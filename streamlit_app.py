@@ -5,16 +5,19 @@ from langchain.chat_models import ChatOpenAI
 from langchain import hub
 from langchain.docstore.document import Document
 from langsmith import traceable, Client
-from typing_extensions import List, TypedDict, Optional, Dict, Any
-from langgraph.graph import START, StateGraph
+from typing_extensions import List, TypedDict, Optional, Dict, Any, Sequence, Annotated
+from langgraph.graph import START, StateGraph, MessagesState
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph.message import add_messages
 from langchain_openai import OpenAIEmbeddings
 from langchain_pinecone import PineconeVectorStore
 from langchain.memory import ConversationBufferMemory
-from langchain.schema import AIMessage, HumanMessage, SystemMessage
+from langchain.schema import AIMessage, HumanMessage, SystemMessage, BaseMessage
 from langchain.callbacks.base import BaseCallbackHandler
 import time
 import pinecone
 import json
+import uuid
 
 #Keys
 os.environ["PINECONE_API_KEY"] = st.secrets["PINECONE_API_KEY"]
@@ -40,10 +43,12 @@ class StreamHandler(BaseCallbackHandler):
         self.container.markdown(self.text)
 
 
-class State(TypedDict):
+# Define our state schema for LangGraph
+class ChatState(TypedDict):
     question: str
     context: List[Document]
-    doc_metadata: List[Dict[str, Any]]  # For storing document metadata
+    doc_metadata: List[Dict[str, Any]]
+    messages: Annotated[Sequence[BaseMessage], add_messages]
     answer: Optional[str]
 
 
@@ -145,7 +150,7 @@ def get_prompt_content(prompt_name_or_id):
 
 
 @traceable
-def retrieve(state: State):
+def retrieve(state: ChatState):
     # Get the currently selected index from session state
     current_index = st.session_state.get("selected_index", DEFAULT_PINECONE_INDEX)
     
@@ -194,7 +199,7 @@ def retrieve(state: State):
 
 
 @traceable
-def generate(state: State):
+def generate(state: ChatState):
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
     
     # Get current selected prompt from session state
@@ -223,16 +228,8 @@ def generate(state: State):
     # Format context from retrieved documents
     docs_content = "\n\n".join(doc.page_content for doc in state["context"])
     
-    # Get chat history from memory and convert to serializable format
-    chat_history = st.session_state.memory.chat_memory.messages
-    serialized_history = []
-    for msg in chat_history:
-        if isinstance(msg, HumanMessage):
-            serialized_history.append({"role": "human", "content": msg.content})
-        elif isinstance(msg, AIMessage):
-            serialized_history.append({"role": "assistant", "content": msg.content})
-        elif isinstance(msg, SystemMessage):
-            serialized_history.append({"role": "system", "content": msg.content})
+    # Get all previous messages
+    previous_messages = state.get("messages", [])
     
     # Simplified one-shot approach
     # Create messages based on prompt type
@@ -241,13 +238,23 @@ def generate(state: State):
             # Check required variables for this template
             required_variables = getattr(current_prompt, 'input_variables', [])
             
+            # Convert BaseMessage objects to dict for JSON serialization if needed
+            serialized_messages = []
+            for msg in previous_messages:
+                if isinstance(msg, HumanMessage):
+                    serialized_messages.append({"role": "human", "content": msg.content})
+                elif isinstance(msg, AIMessage):
+                    serialized_messages.append({"role": "assistant", "content": msg.content})
+                elif isinstance(msg, SystemMessage):
+                    serialized_messages.append({"role": "system", "content": msg.content})
+            
             # Prepare variables based on template requirements
             if 'json_data' in required_variables:
                 # Some templates expect JSON input
                 json_data = {
                     "context": docs_content,
                     "question": state["question"],
-                    "chat_history": serialized_history
+                    "chat_history": serialized_messages
                 }
                 input_variables = {"json_data": json.dumps(json_data)}
             elif 'context' in required_variables and 'question' in required_variables:
@@ -255,7 +262,7 @@ def generate(state: State):
                 input_variables = {
                     "context": docs_content,
                     "question": state["question"],
-                    "chat_history": serialized_history
+                    "chat_history": serialized_messages
                 }
             else:
                 # Fall back to whatever variables the template expects
@@ -269,7 +276,7 @@ def generate(state: State):
                 if 'input' in required_variables:
                     input_variables['input'] = state["question"]
                 if 'chat_history' in required_variables:
-                    input_variables['chat_history'] = serialized_history
+                    input_variables['chat_history'] = serialized_messages
             
             # Invoke the template with our variables
             messages = current_prompt.invoke(input_variables)
@@ -280,18 +287,22 @@ def generate(state: State):
             # Simple system prompt + context + question format
             messages = [
                 SystemMessage(content=str(current_prompt)),
-                SystemMessage(content=f"Context information:\n{docs_content}"),
-                *chat_history,  # Add chat history
-                HumanMessage(content=state["question"])
+                SystemMessage(content=f"Context information:\n{docs_content}")
             ]
+            # Add previous messages
+            messages.extend(previous_messages)
+            # Add current question
+            messages.append(HumanMessage(content=state["question"]))
     else:
         # For basic string prompts, use the traditional approach
         messages = [
             SystemMessage(content=str(current_prompt)),
-            SystemMessage(content=f"Context information:\n{docs_content}"),
-            *chat_history,  # Add chat history
-            HumanMessage(content=state["question"])
+            SystemMessage(content=f"Context information:\n{docs_content}")
         ]
+        # Add previous messages
+        messages.extend(previous_messages)
+        # Add current question
+        messages.append(HumanMessage(content=state["question"]))
     
     # Set up streaming
     stream_handler = StreamHandler(st.empty())
@@ -308,26 +319,28 @@ def generate(state: State):
     # Generate response
     response = llm.invoke(messages)
     
-    # Save the conversation to memory
-    st.session_state.memory.save_context(
-        {"input": state["question"]},
-        {"output": response.content}
-    )
-    
-    # Return the answer (the UI code will handle storing the message with metadata)
-    return {"answer": response.content}
- 
+    # Return the answer and add the messages to state
+    return {
+        "answer": response.content,
+        "messages": [HumanMessage(content=state["question"]), response]
+    }
 
-# Initialize session state for chat history (simplified, no memory)
-if "messages" not in st.session_state:
-    st.session_state.messages = []
 
-# Initialize conversation memory
-if "memory" not in st.session_state:
-    st.session_state.memory = ConversationBufferMemory(
-        memory_key="chat_history",
-        return_messages=True
-    )
+# Create a unique thread ID for each user session if not exists
+if "thread_id" not in st.session_state:
+    st.session_state.thread_id = str(uuid.uuid4())
+
+# Initialize session state for tracking last retrieval count
+if "last_retrieval_count" not in st.session_state:
+    st.session_state.last_retrieval_count = None
+
+# Initialize session state for tracking document metadata
+if "last_docs_metadata" not in st.session_state:
+    st.session_state.last_docs_metadata = []
+
+# Initialize session state for tracking enhanced query
+if "last_query" not in st.session_state:
+    st.session_state.last_query = None
 
 # Initialize session state for selected index
 if "selected_index" not in st.session_state:
@@ -341,17 +354,14 @@ if "selected_prompt" not in st.session_state:
 if "num_docs" not in st.session_state:
     st.session_state.num_docs = DEFAULT_NUM_DOCS
 
-# Initialize session state for tracking last retrieval count
-if "last_retrieval_count" not in st.session_state:
-    st.session_state.last_retrieval_count = None
-
-# Initialize session state for tracking document metadata
-if "last_docs_metadata" not in st.session_state:
-    st.session_state.last_docs_metadata = []
-
-# Initialize session state for tracking enhanced query
-if "last_query" not in st.session_state:
-    st.session_state.last_query = None
+# Create LangGraph workflow for chat
+memory = MemorySaver()
+workflow = StateGraph(state_schema=ChatState)
+workflow.add_node("retrieve", retrieve)
+workflow.add_node("generate", generate)
+workflow.add_edge(START, "retrieve")
+workflow.add_edge("retrieve", "generate")
+graph = workflow.compile(checkpointer=memory)
 
 st.set_page_config(
     page_title="Segment Explorer AI Assistant",
@@ -472,12 +482,17 @@ with st.sidebar.expander("Prompt Selection", expanded=True):
 
 # Add a separate button to clear chat history
 if st.sidebar.button("Clear Chat History"):
-    st.session_state.messages = []
-    st.session_state.memory = ConversationBufferMemory(
-        memory_key="chat_history",
-        return_messages=True
-    )
-    st.sidebar.success("Chat history cleared.")
+    # Clear the memory for the current thread
+    config = {"configurable": {"thread_id": st.session_state.thread_id}}
+    try:
+        # Reset thread ID to create a new conversation thread instead of trying to delete state
+        st.session_state.thread_id = str(uuid.uuid4())
+        # Clear any stored metadata
+        st.session_state.last_docs_metadata = []
+        st.session_state.last_retrieval_count = None
+        st.sidebar.success("Chat history cleared.")
+    except Exception as e:
+        st.sidebar.error(f"Error clearing chat history: {e}")
 
 # Add advanced debugging options
 with st.sidebar.expander("Advanced Options", expanded=False):
@@ -524,35 +539,56 @@ st.write(
     "Ask me questions about Senegal Segmentation Data and the Pathways Methodology."
 )
 
-# Display chat messages from history (keeping this for UI consistency)
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-        
-        # If this is an assistant message with document metadata, display it
-        if message["role"] == "assistant" and "doc_metadata" in message and message["doc_metadata"]:
-            doc_metadata = message["doc_metadata"]
-            with st.expander(f"📚 Source Documents ({len(doc_metadata)})"):
-                for i, doc_meta in enumerate(doc_metadata):
-                    doc_num = i + 1
-                    st.markdown(f"**Document {doc_num}:**")
-                    
-                    # Display metadata in a clean format
-                    if 'content_preview' in doc_meta:
-                        st.markdown(f"*Preview:* {doc_meta['content_preview']}")
-                        # Remove content_preview from display to avoid duplication
-                        display_meta = {k: v for k, v in doc_meta.items() if k != 'content_preview'}
-                    else:
-                        display_meta = doc_meta
-                    
-                    # Display remaining metadata if any
-                    if display_meta:
-                        for key, value in display_meta.items():
-                            st.markdown(f"*{key}:* {value}")
-                    
-                    # Add a separator between documents
-                    if i < len(doc_metadata) - 1:
-                        st.markdown("---")
+# Get message history from LangGraph state if available
+config = {"configurable": {"thread_id": st.session_state.thread_id}}
+try:
+    current_state = graph.get_state(config)
+    message_history = []
+    
+    # Get messages from graph state if available
+    if current_state and "values" in current_state and "messages" in current_state.values:
+        message_history = current_state.values["messages"]
+    
+    # Store in session state for display persistence
+    if "display_messages" not in st.session_state:
+        st.session_state.display_messages = []
+    
+    # If we have messages from graph state, update the display messages
+    if message_history:
+        st.session_state.display_messages = message_history
+    
+    # Display messages from session state for UI persistence
+    for message in st.session_state.display_messages:
+        with st.chat_message("user" if isinstance(message, HumanMessage) else "assistant"):
+            st.markdown(message.content)
+            
+            # If this is an assistant message, show document metadata
+            if isinstance(message, AIMessage) and hasattr(st.session_state, 'last_docs_metadata') and st.session_state.last_docs_metadata:
+                doc_metadata = st.session_state.last_docs_metadata
+                with st.expander(f"📚 Source Documents ({len(doc_metadata)})"):
+                    for i, doc_meta in enumerate(doc_metadata):
+                        doc_num = i + 1
+                        st.markdown(f"**Document {doc_num}:**")
+                        
+                        # Display metadata in a clean format
+                        if 'content_preview' in doc_meta:
+                            st.markdown(f"*Preview:* {doc_meta['content_preview']}")
+                            # Remove content_preview from display to avoid duplication
+                            display_meta = {k: v for k, v in doc_meta.items() if k != 'content_preview'}
+                        else:
+                            display_meta = doc_meta
+                        
+                        # Display remaining metadata if any
+                        if display_meta:
+                            for key, value in display_meta.items():
+                                st.markdown(f"*{key}:* {value}")
+                        
+                        # Add a separator between documents
+                        if i < len(doc_metadata) - 1:
+                            st.markdown("---")
+except Exception as e:
+    st.error(f"Error retrieving chat history: {e}")
+    # If there's an error, we'll just not display any history
 
 # Show retrieval information if available
 if st.session_state.last_retrieval_count is not None:
@@ -561,34 +597,33 @@ if st.session_state.last_retrieval_count is not None:
 
 # Accept user input
 if prompt := st.chat_input("What would you like to know?"):
-    # Add user message to chat history
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    
     # Display user message in chat message container
     with st.chat_message("user"):
         st.markdown(prompt)
     
+    # Add user message to display history
+    if "display_messages" not in st.session_state:
+        st.session_state.display_messages = []
+    st.session_state.display_messages.append(HumanMessage(content=prompt))
+    
     # Display assistant response in chat message container
     with st.chat_message("assistant"):
-        # Build the graph
-        graph_builder = StateGraph(State).add_sequence([retrieve, generate])
-        graph_builder.add_edge(START, "retrieve")
-        graph = graph_builder.compile()
+        # Set up LangGraph config
+        config = {"configurable": {"thread_id": st.session_state.thread_id}}
         
-        # Invoke the graph with streaming - simplified without chat history
+        # Invoke the graph with streaming
         result = graph.invoke({
             "question": prompt,
             "context": [],
             "doc_metadata": [],
+            "messages": st.session_state.display_messages.copy(),
             "answer": None
-        })
+        }, config)
         
-        # Add assistant response to chat history
-        st.session_state.messages.append({
-            "role": "assistant", 
-            "content": result["answer"],
-            "doc_metadata": st.session_state.last_docs_metadata.copy() if st.session_state.last_docs_metadata else []
-        })
+        # Add AI response to display history
+        if result and "answer" in result:
+            ai_message = AIMessage(content=result["answer"])
+            st.session_state.display_messages.append(ai_message)
         
         # Display document metadata after response in an expander
         if st.session_state.last_docs_metadata:

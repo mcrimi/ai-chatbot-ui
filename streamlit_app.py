@@ -7,7 +7,7 @@ from langchain.docstore.document import Document
 from langsmith import traceable, Client
 from typing_extensions import List, TypedDict, Optional, Dict, Any, Sequence, Annotated
 from langgraph.graph import START, StateGraph, MessagesState
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph.message import add_messages
 from langchain_openai import OpenAIEmbeddings
 from langchain_pinecone import PineconeVectorStore
@@ -18,6 +18,19 @@ import time
 import pinecone
 import json
 import uuid
+
+# Set page config first
+st.set_page_config(
+    page_title="Segment Explorer AI Assistant",
+    page_icon="🤖",
+    layout="wide",
+    initial_sidebar_state="expanded",
+    menu_items={
+        'Get Help': 'https://docs.streamlit.io/',
+        'Report a bug': 'https://github.com/streamlit/streamlit/issues',
+        'About': "### Segment Explorer AI Assistant"
+    }
+)
 
 #Keys
 os.environ["PINECONE_API_KEY"] = st.secrets["PINECONE_API_KEY"]
@@ -50,6 +63,10 @@ class ChatState(TypedDict):
     doc_metadata: List[Dict[str, Any]]
     messages: Annotated[Sequence[BaseMessage], add_messages]
     answer: Optional[str]
+    last_retrieval_count: Optional[int]
+    selected_index: str
+    num_docs: int
+    selected_prompt: Optional[Dict[str, str]]
 
 
 def get_available_indexes():
@@ -149,29 +166,36 @@ def get_prompt_content(prompt_name_or_id):
         return ""
 
 
+def create_llm(stream_handler: StreamHandler) -> ChatOpenAI:
+    """Create and return a configured ChatOpenAI instance."""
+    return ChatOpenAI(
+        model_name="gpt-4",
+        temperature=0.5,
+        openai_api_key=os.getenv("OPENAI_API_KEY"),
+        streaming=True,
+        callbacks=[stream_handler]
+    )
+
+
 @traceable
 def retrieve(state: ChatState):
-    # Get the currently selected index from session state
-    current_index = st.session_state.get("selected_index", DEFAULT_PINECONE_INDEX)
-    
-    # Get number of documents to retrieve from session state
-    num_docs = st.session_state.get("num_docs", DEFAULT_NUM_DOCS)
+    # Get the latest question from messages
+    latest_message = state["messages"][-1]
+    if not isinstance(latest_message, HumanMessage):
+        return state
     
     embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
     
     try:
         # Initialize Pinecone with newer SDK syntax
         pc = pinecone.Pinecone(api_key=os.environ["PINECONE_API_KEY"])
-        index = pc.Index(current_index)
+        index = pc.Index(state["selected_index"])
         
         # Create vector store using the index
         vectorstore = PineconeVectorStore(index=index, embedding=embeddings)
         
         # Perform similarity search with the query
-        retrieved_docs = vectorstore.similarity_search(state["question"], k=num_docs)
-        
-        # Log the number of documents retrieved
-        st.session_state.last_retrieval_count = len(retrieved_docs)
+        retrieved_docs = vectorstore.similarity_search(latest_message.content, k=state["num_docs"])
         
         # Extract metadata from documents
         doc_metadata = []
@@ -182,165 +206,95 @@ def retrieve(state: ChatState):
             metadata['content_preview'] = content_preview
             doc_metadata.append(metadata)
         
-        # Store document metadata in session state for later display
-        st.session_state.last_docs_metadata = doc_metadata
+        # Add context as a system message
+        context_content = "\n\n".join(doc.page_content for doc in retrieved_docs)
+        context_message = SystemMessage(content=f"Context information:\n{context_content}")
         
+        # Update state with retrieved information
         return {
+            **state,
             "context": retrieved_docs,
-            "doc_metadata": doc_metadata
+            "doc_metadata": doc_metadata,
+            "last_retrieval_count": len(retrieved_docs),
+            "messages": state["messages"] + [context_message]
         }
+        
     except Exception as e:
-        st.error(f"Error retrieving documents from index '{current_index}': {e}")
-        empty_metadata = []
+        error_message = SystemMessage(content=f"Error retrieving documents: {e}")
         return {
-            "context": [Document(page_content=f"Error retrieving documents: {e}")],
-            "doc_metadata": empty_metadata
+            **state,
+            "messages": state["messages"] + [error_message]
         }
 
 
 @traceable
 def generate(state: ChatState):
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-    
-    # Get current selected prompt from session state
+    # Get current selected prompt
     current_prompt = None
-    if st.session_state.selected_prompt:
+    if state["selected_prompt"]:
         try:
             # Extract repo handle from the selected prompt
-            if isinstance(st.session_state.selected_prompt, dict):
-                repo_handle = st.session_state.selected_prompt.get('name')
-            else:
-                repo_handle = st.session_state.selected_prompt
+            repo_handle = state["selected_prompt"].get('name')
+            if not repo_handle:
+                error_message = AIMessage(content="Error: The selected prompt could not be retrieved. Please select a different prompt.")
+                return {**state, "messages": state["messages"] + [error_message]}
                 
             # Use hub.pull to get the prompt directly
             current_prompt = hub.pull(repo_handle)
             if not current_prompt:
-                st.error(f"Selected prompt '{repo_handle}' could not be retrieved.")
-                return {"answer": "Error: The selected prompt could not be retrieved. Please select a different prompt."}
+                error_message = AIMessage(content="Error: The selected prompt could not be retrieved. Please select a different prompt.")
+                return {**state, "messages": state["messages"] + [error_message]}
         except Exception as e:
-            st.error(f"Error retrieving prompt from LangChain Hub: {e}")
-            return {"answer": f"Error retrieving prompt: {e}. Please select a different prompt or try again."}
+            error_message = AIMessage(content=f"Error retrieving prompt: {e}. Please select a different prompt or try again.")
+            return {**state, "messages": state["messages"] + [error_message]}
     
     if not current_prompt:
-        st.error("No valid prompt selected. Please select a valid prompt from LangChain Hub.")
-        return {"answer": "Error: No valid prompt is selected. Please select a prompt from the sidebar."}
+        error_message = AIMessage(content="Error: No valid prompt is selected. Please select a prompt from the sidebar.")
+        return {**state, "messages": state["messages"] + [error_message]}
     
-    # Format context from retrieved documents
-    docs_content = "\n\n".join(doc.page_content for doc in state["context"])
-    
-    # Get all previous messages
-    previous_messages = state.get("messages", [])
-    
-    # Simplified one-shot approach
-    # Create messages based on prompt type
-    if hasattr(current_prompt, "invoke"):
-        try:
-            # Check required variables for this template
-            required_variables = getattr(current_prompt, 'input_variables', [])
+    try:
+        # Add the system prompt at the beginning if not already present
+        if not any(isinstance(msg, SystemMessage) and not msg.content.startswith("Context information:") for msg in state["messages"]):
+            messages = [SystemMessage(content=str(current_prompt))] + state["messages"]
+        else:
+            messages = state["messages"]
+        
+        # Create LLM for this turn
+        stream_handler = StreamHandler(st.empty())
+        llm = create_llm(stream_handler)
             
-            # Convert BaseMessage objects to dict for JSON serialization if needed
-            serialized_messages = []
-            for msg in previous_messages:
-                if isinstance(msg, HumanMessage):
-                    serialized_messages.append({"role": "human", "content": msg.content})
-                elif isinstance(msg, AIMessage):
-                    serialized_messages.append({"role": "assistant", "content": msg.content})
-                elif isinstance(msg, SystemMessage):
-                    serialized_messages.append({"role": "system", "content": msg.content})
-            
-            # Prepare variables based on template requirements
-            if 'json_data' in required_variables:
-                # Some templates expect JSON input
-                json_data = {
-                    "context": docs_content,
-                    "question": state["question"],
-                    "chat_history": serialized_messages
-                }
-                input_variables = {"json_data": json.dumps(json_data)}
-            elif 'context' in required_variables and 'question' in required_variables:
-                # Standard variables
-                input_variables = {
-                    "context": docs_content,
-                    "question": state["question"],
-                    "chat_history": serialized_messages
-                }
-            else:
-                # Fall back to whatever variables the template expects
-                input_variables = {}
-                if 'context' in required_variables:
-                    input_variables['context'] = docs_content
-                if 'question' in required_variables:
-                    input_variables['question'] = state["question"]
-                if 'query' in required_variables:
-                    input_variables['query'] = state["question"]
-                if 'input' in required_variables:
-                    input_variables['input'] = state["question"]
-                if 'chat_history' in required_variables:
-                    input_variables['chat_history'] = serialized_messages
-            
-            # Invoke the template with our variables
-            messages = current_prompt.invoke(input_variables)
-        except Exception as e:
-            # Fall back to basic format if template invocation fails
-            st.warning(f"Error using template with invoke: {e}. Falling back to basic format.")
-            
-            # Simple system prompt + context + question format
-            messages = [
-                SystemMessage(content=str(current_prompt)),
-                SystemMessage(content=f"Context information:\n{docs_content}")
-            ]
-            # Add previous messages
-            messages.extend(previous_messages)
-            # Add current question
-            messages.append(HumanMessage(content=state["question"]))
-    else:
-        # For basic string prompts, use the traditional approach
-        messages = [
-            SystemMessage(content=str(current_prompt)),
-            SystemMessage(content=f"Context information:\n{docs_content}")
-        ]
-        # Add previous messages
-        messages.extend(previous_messages)
-        # Add current question
-        messages.append(HumanMessage(content=state["question"]))
-    
-    # Set up streaming
-    stream_handler = StreamHandler(st.empty())
-    
-    # Create LLM with streaming
-    llm = ChatOpenAI(
-        model_name="gpt-4", 
-        temperature=0.5, 
-        openai_api_key=OPENAI_API_KEY,
-        streaming=True,
-        callbacks=[stream_handler]
-    )
-    
-    # Generate response
-    response = llm.invoke(messages)
-    
-    # Return the answer and add the messages to state
-    return {
-        "answer": response.content,
-        "messages": [HumanMessage(content=state["question"]), response]
-    }
+        # Generate response
+        response = llm.invoke(messages)
+        
+        # Return updated state with the new response
+        return {
+            **state,
+            "messages": state["messages"] + [response],
+            "answer": response.content
+        }
+        
+    except Exception as e:
+        error_message = AIMessage(content=f"Error generating response: {e}")
+        return {**state, "messages": state["messages"] + [error_message]}
 
 
-# Create a unique thread ID for each user session if not exists
-if "thread_id" not in st.session_state:
-    st.session_state.thread_id = str(uuid.uuid4())
+# Create LangGraph workflow for chat
+@st.cache_resource
+def create_chat_graph():
+    """Create and return the chat graph. This function is cached to ensure the graph is only created once."""
+    memory = InMemorySaver()
+    workflow = StateGraph(ChatState)
+    workflow.add_node("retrieve", retrieve)
+    workflow.add_node("generate", generate)
+    workflow.add_edge(START, "retrieve")
+    workflow.add_edge("retrieve", "generate")
+    return workflow.compile(checkpointer=memory)
 
-# Initialize session state for tracking last retrieval count
-if "last_retrieval_count" not in st.session_state:
-    st.session_state.last_retrieval_count = None
 
-# Initialize session state for tracking document metadata
-if "last_docs_metadata" not in st.session_state:
-    st.session_state.last_docs_metadata = []
+# Create the graph once and cache it
+graph = create_chat_graph()
 
-# Initialize session state for tracking enhanced query
-if "last_query" not in st.session_state:
-    st.session_state.last_query = None
+# Streamlit UI code starts here
 
 # Initialize session state for selected index
 if "selected_index" not in st.session_state:
@@ -354,26 +308,9 @@ if "selected_prompt" not in st.session_state:
 if "num_docs" not in st.session_state:
     st.session_state.num_docs = DEFAULT_NUM_DOCS
 
-# Create LangGraph workflow for chat
-memory = MemorySaver()
-workflow = StateGraph(state_schema=ChatState)
-workflow.add_node("retrieve", retrieve)
-workflow.add_node("generate", generate)
-workflow.add_edge(START, "retrieve")
-workflow.add_edge("retrieve", "generate")
-graph = workflow.compile(checkpointer=memory)
-
-st.set_page_config(
-    page_title="Segment Explorer AI Assistant",
-    page_icon="🤖",
-    layout="wide",
-    initial_sidebar_state="expanded",
-    menu_items={
-        'Get Help': 'https://docs.streamlit.io/',
-        'Report a bug': 'https://github.com/streamlit/streamlit/issues',
-        'About': "### Segment Explorer AI Assistant"
-    }
-)
+# Create a unique thread ID for each user session if not exists
+if "thread_id" not in st.session_state:
+    st.session_state.thread_id = str(uuid.uuid4())
 
 # Sidebar with configuration options
 st.sidebar.title("Configuration")
@@ -485,11 +422,10 @@ if st.sidebar.button("Clear Chat History"):
     # Clear the memory for the current thread
     config = {"configurable": {"thread_id": st.session_state.thread_id}}
     try:
-        # Reset thread ID to create a new conversation thread instead of trying to delete state
+        # Clear the memory for this thread
+        memory.clear(config)
+        # Reset thread ID to create a new conversation thread
         st.session_state.thread_id = str(uuid.uuid4())
-        # Clear any stored metadata
-        st.session_state.last_docs_metadata = []
-        st.session_state.last_retrieval_count = None
         st.sidebar.success("Chat history cleared.")
     except Exception as e:
         st.sidebar.error(f"Error clearing chat history: {e}")
@@ -539,112 +475,59 @@ st.write(
     "Ask me questions about Senegal Segmentation Data and the Pathways Methodology."
 )
 
-# Get message history from LangGraph state if available
-config = {"configurable": {"thread_id": st.session_state.thread_id}}
-try:
-    current_state = graph.get_state(config)
-    message_history = []
+# Accept user input
+if prompt := st.chat_input("What would you like to know?"):
+    # Display user message
+    with st.chat_message("user"):
+        st.markdown(prompt)
     
-    # Get messages from graph state if available
-    if current_state and "values" in current_state and "messages" in current_state.values:
-        message_history = current_state.values["messages"]
-    
-    # Store in session state for display persistence
-    if "display_messages" not in st.session_state:
-        st.session_state.display_messages = []
-    
-    # If we have messages from graph state, update the display messages
-    if message_history:
-        st.session_state.display_messages = message_history
-    
-    # Display messages from session state for UI persistence
-    for message in st.session_state.display_messages:
-        with st.chat_message("user" if isinstance(message, HumanMessage) else "assistant"):
-            st.markdown(message.content)
+    # Display assistant response
+    with st.chat_message("assistant"):
+        try:
+            # Set up LangGraph config
+            config = {"configurable": {"thread_id": st.session_state.thread_id}}
             
-            # If this is an assistant message, show document metadata
-            if isinstance(message, AIMessage) and hasattr(st.session_state, 'last_docs_metadata') and st.session_state.last_docs_metadata:
-                doc_metadata = st.session_state.last_docs_metadata
+            # Get current state from memory
+            current_state = graph.get_state(config)
+            
+            # Create initial state for this turn
+            initial_state = {
+                "question": prompt,
+                "context": current_state.values.get("context", []) if current_state and hasattr(current_state, 'values') else [],
+                "doc_metadata": current_state.values.get("doc_metadata", []) if current_state and hasattr(current_state, 'values') else [],
+                "messages": (current_state.values.get("messages", []) if current_state and hasattr(current_state, 'values') else []) + [HumanMessage(content=prompt)],
+                "answer": current_state.values.get("answer") if current_state and hasattr(current_state, 'values') else None,
+                "last_retrieval_count": current_state.values.get("last_retrieval_count") if current_state and hasattr(current_state, 'values') else None,
+                "selected_index": st.session_state.selected_index,
+                "num_docs": st.session_state.num_docs,
+                "selected_prompt": st.session_state.selected_prompt
+            }
+            
+            # Invoke the graph
+            result = graph.invoke(initial_state, config=config)
+            
+            # Display document metadata if available
+            if result.get("doc_metadata"):
+                doc_metadata = result["doc_metadata"]
                 with st.expander(f"📚 Source Documents ({len(doc_metadata)})"):
                     for i, doc_meta in enumerate(doc_metadata):
                         doc_num = i + 1
                         st.markdown(f"**Document {doc_num}:**")
-                        
-                        # Display metadata in a clean format
                         if 'content_preview' in doc_meta:
                             st.markdown(f"*Preview:* {doc_meta['content_preview']}")
-                            # Remove content_preview from display to avoid duplication
                             display_meta = {k: v for k, v in doc_meta.items() if k != 'content_preview'}
                         else:
                             display_meta = doc_meta
-                        
-                        # Display remaining metadata if any
                         if display_meta:
                             for key, value in display_meta.items():
                                 st.markdown(f"*{key}:* {value}")
-                        
-                        # Add a separator between documents
                         if i < len(doc_metadata) - 1:
                             st.markdown("---")
-except Exception as e:
-    st.error(f"Error retrieving chat history: {e}")
-    # If there's an error, we'll just not display any history
-
-# Show retrieval information if available
-if st.session_state.last_retrieval_count is not None:
-    retrieved_count = st.session_state.last_retrieval_count
-    st.caption(f"Last query retrieved {retrieved_count} document{'s' if retrieved_count != 1 else ''} from the knowledge base.")
-
-# Accept user input
-if prompt := st.chat_input("What would you like to know?"):
-    # Display user message in chat message container
-    with st.chat_message("user"):
-        st.markdown(prompt)
-    
-    # Add user message to display history
-    if "display_messages" not in st.session_state:
-        st.session_state.display_messages = []
-    st.session_state.display_messages.append(HumanMessage(content=prompt))
-    
-    # Display assistant response in chat message container
-    with st.chat_message("assistant"):
-        # Set up LangGraph config
-        config = {"configurable": {"thread_id": st.session_state.thread_id}}
-        
-        # Invoke the graph with streaming
-        result = graph.invoke({
-            "question": prompt,
-            "context": [],
-            "doc_metadata": [],
-            "messages": st.session_state.display_messages.copy(),
-            "answer": None
-        }, config)
-        
-        # Add AI response to display history
-        if result and "answer" in result:
-            ai_message = AIMessage(content=result["answer"])
-            st.session_state.display_messages.append(ai_message)
-        
-        # Display document metadata after response in an expander
-        if st.session_state.last_docs_metadata:
-            with st.expander(f"📚 Source Documents ({len(st.session_state.last_docs_metadata)})"):
-                for i, doc_meta in enumerate(st.session_state.last_docs_metadata):
-                    doc_num = i + 1
-                    st.markdown(f"**Document {doc_num}:**")
-                    
-                    # Display metadata in a clean format
-                    if 'content_preview' in doc_meta:
-                        st.markdown(f"*Preview:* {doc_meta['content_preview']}")
-                        # Remove content_preview from display to avoid duplication
-                        display_meta = {k: v for k, v in doc_meta.items() if k != 'content_preview'}
-                    else:
-                        display_meta = doc_meta
-                    
-                    # Display remaining metadata if any
-                    if display_meta:
-                        for key, value in display_meta.items():
-                            st.markdown(f"*{key}:* {value}")
-                    
-                    # Add a separator between documents
-                    if i < len(st.session_state.last_docs_metadata) - 1:
-                        st.markdown("---")
+            
+            # Show retrieval information if available
+            if result.get("last_retrieval_count") is not None:
+                retrieved_count = result["last_retrieval_count"]
+                st.caption(f"Last query retrieved {retrieved_count} document{'s' if retrieved_count != 1 else ''} from the knowledge base.")
+                
+        except Exception as e:
+            st.error(f"Error processing request: {e}")

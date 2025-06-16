@@ -18,6 +18,23 @@ import time
 import pinecone
 import json
 import uuid
+import atexit
+
+# Global memory variable
+memory = None
+
+# Session management
+def clear_session_memory():
+    """Clear memory when session ends"""
+    try:
+        if 'thread_id' in st.session_state and memory is not None:
+            config = {"configurable": {"thread_id": st.session_state.thread_id}}
+            memory.clear(config)
+    except Exception as e:
+        print(f"Error clearing session memory: {e}")
+
+# Register cleanup function
+atexit.register(clear_session_memory)
 
 # Set page config first
 st.set_page_config(
@@ -40,9 +57,9 @@ os.environ["LANGCHAIN_TRACING_V2"] = "true"
 os.environ["LANGSMITH_PROJECT"] = "pathways-ai-assistant"
 
 #Constants
-DEFAULT_PINECONE_INDEX = "senegal-metrics-v1-1"
+DEFAULT_PINECONE_INDEX = "segment-explorer-v1-0"
 EMBEDDING_MODEL = "text-embedding-3-large"
-DEFAULT_NUM_DOCS = 4  # Default number of documents to retrieve
+DEFAULT_NUM_DOCS = 10  # Default number of documents to retrieve
 
 
 class StreamHandler(BaseCallbackHandler):
@@ -169,7 +186,7 @@ def get_prompt_content(prompt_name_or_id):
 def create_llm(stream_handler: StreamHandler) -> ChatOpenAI:
     """Create and return a configured ChatOpenAI instance."""
     return ChatOpenAI(
-        model_name="gpt-4",
+        model_name="gpt-4o",
         temperature=0.5,
         openai_api_key=os.getenv("OPENAI_API_KEY"),
         streaming=True,
@@ -206,17 +223,13 @@ def retrieve(state: ChatState):
             metadata['content_preview'] = content_preview
             doc_metadata.append(metadata)
         
-        # Add context as a system message
-        context_content = "\n\n".join(doc.page_content for doc in retrieved_docs)
-        context_message = SystemMessage(content=f"Context information:\n{context_content}")
-        
         # Update state with retrieved information
         return {
             **state,
-            "context": retrieved_docs,
+            "context": retrieved_docs,  # Store retrieved documents
             "doc_metadata": doc_metadata,
             "last_retrieval_count": len(retrieved_docs),
-            "messages": state["messages"] + [context_message]
+            "messages": state["messages"]  # Keep existing messages
         }
         
     except Exception as e:
@@ -253,11 +266,33 @@ def generate(state: ChatState):
         return {**state, "messages": state["messages"] + [error_message]}
     
     try:
-        # Add the system prompt at the beginning if not already present
-        if not any(isinstance(msg, SystemMessage) and not msg.content.startswith("Context information:") for msg in state["messages"]):
-            messages = [SystemMessage(content=str(current_prompt))] + state["messages"]
-        else:
-            messages = state["messages"]
+        # Get the current question from the last human message
+        current_question = None
+        for msg in reversed(state["messages"]):
+            if isinstance(msg, HumanMessage):
+                current_question = msg
+                break
+        
+        if not current_question:
+            error_message = AIMessage(content="Error: No question found in the conversation.")
+            return {**state, "messages": state["messages"] + [error_message]}
+        
+        # Create a minimal message history with:
+        # 1. Last 3 message pairs (6 messages total)
+        non_system_messages = [msg for msg in state["messages"] if not isinstance(msg, SystemMessage)]
+        recent_messages = non_system_messages[-6:] if len(non_system_messages) > 6 else non_system_messages
+        
+        # Format context from retrieved documents
+        context_content = "\n\n".join(doc.page_content for doc in state["context"]) if state["context"] else ""
+        
+        # Format the prompt with context and question
+        formatted_prompt = current_prompt.format(
+            context=context_content,
+            question=current_question.content
+        )
+        
+        # Create messages for the LLM
+        messages = [SystemMessage(content=formatted_prompt)] + recent_messages
         
         # Create LLM for this turn
         stream_handler = StreamHandler(st.empty())
@@ -282,6 +317,7 @@ def generate(state: ChatState):
 @st.cache_resource
 def create_chat_graph():
     """Create and return the chat graph. This function is cached to ensure the graph is only created once."""
+    global memory
     memory = InMemorySaver()
     workflow = StateGraph(ChatState)
     workflow.add_node("retrieve", retrieve)
@@ -315,40 +351,9 @@ if "thread_id" not in st.session_state:
 # Sidebar with configuration options
 st.sidebar.title("Configuration")
 
-# Pinecone index selection
-st.sidebar.subheader("Knowledge Base")
-available_indexes = get_available_indexes()
-selected_index = st.sidebar.selectbox(
-    "Select Pinecone Index",
-    options=available_indexes,
-    index=available_indexes.index(st.session_state.selected_index) if st.session_state.selected_index in available_indexes else 0
-)
-
-# Number of documents to retrieve
-num_docs = st.sidebar.slider(
-    "Number of documents to retrieve",
-    min_value=2,
-    max_value=20,
-    value=st.session_state.num_docs,
-    step=1,
-    help="Adjust the number of documents retrieved from the vector database during search"
-)
-
-# Update session state if num_docs changed
-if num_docs != st.session_state.num_docs:
-    st.session_state.num_docs = num_docs
-    st.sidebar.success(f"Will now retrieve {num_docs} documents per query.")
-
-# Update session state if index changed
-if selected_index != st.session_state.selected_index:
-    st.session_state.selected_index = selected_index
-    # Clear chat history when changing index
-    st.session_state.messages = []
-    st.sidebar.success(f"Switched to index: {selected_index}. Chat history cleared.")
-
-# Prompt selection
+# Prompt selection and Assistant Behavior section
 st.sidebar.subheader("Assistant Behavior")
-with st.sidebar.expander("Prompt Selection", expanded=True):
+with st.sidebar.expander("Assistant Configuration", expanded=False):
     try:
         available_prompts = get_available_prompts()
         
@@ -359,21 +364,24 @@ with st.sidebar.expander("Prompt Selection", expanded=True):
             # Extract names for display in selectbox
             prompt_names = [p['name'] for p in available_prompts]
             
+            # Set default index to 'response-generator' if it exists
+            default_index = 0
+            try:
+                default_index = prompt_names.index('response-generator')
+            except ValueError:
+                # If 'response-generator' doesn't exist, use the first prompt
+                default_index = 0
+            
             # If we have a stored prompt that's no longer available, reset it
             if st.session_state.selected_prompt is not None:
                 selected_prompt_id = st.session_state.selected_prompt.get('id') if isinstance(st.session_state.selected_prompt, dict) else None
                 if not any(p['id'] == selected_prompt_id for p in available_prompts):
                     st.session_state.selected_prompt = None
-            
-            # Default index is either the previously selected prompt or the first one
-            default_index = 0
-            if st.session_state.selected_prompt is not None and isinstance(st.session_state.selected_prompt, dict):
-                try:
-                    selected_name = st.session_state.selected_prompt.get('name')
-                    if selected_name in prompt_names:
-                        default_index = prompt_names.index(selected_name)
-                except (ValueError, KeyError):
-                    default_index = 0
+                    # Reset to 'response-generator' if available
+                    try:
+                        default_index = prompt_names.index('response-generator')
+                    except ValueError:
+                        default_index = 0
             
             selected_name = st.selectbox(
                 "Select System Prompt from Langsmith",
@@ -417,16 +425,51 @@ with st.sidebar.expander("Prompt Selection", expanded=True):
     except Exception as e:
         st.error(f"Error loading prompts: {e}")
 
+# Knowledge Base settings in a collapsed expander
+with st.sidebar.expander("Knowledge Base Settings", expanded=False):
+    # Pinecone index selection
+    available_indexes = get_available_indexes()
+    selected_index = st.selectbox(
+        "Select Pinecone Index",
+        options=available_indexes,
+        index=available_indexes.index(st.session_state.selected_index) if st.session_state.selected_index in available_indexes else 0
+    )
+
+    # Number of documents to retrieve
+    num_docs = st.slider(
+        "Number of documents to retrieve",
+        min_value=2,
+        max_value=20,
+        value=st.session_state.num_docs,
+        step=1,
+        help="Adjust the number of documents retrieved from the vector database during search"
+    )
+
+    # Update session state if num_docs changed
+    if num_docs != st.session_state.num_docs:
+        st.session_state.num_docs = num_docs
+        st.success(f"Will now retrieve {num_docs} documents per query.")
+
+    # Update session state if index changed
+    if selected_index != st.session_state.selected_index:
+        st.session_state.selected_index = selected_index
+        # Clear chat history when changing index
+        st.session_state.messages = []
+        st.success(f"Switched to index: {selected_index}. Chat history cleared.")
+
 # Add a separate button to clear chat history
 if st.sidebar.button("Clear Chat History"):
     # Clear the memory for the current thread
     config = {"configurable": {"thread_id": st.session_state.thread_id}}
     try:
         # Clear the memory for this thread
-        memory.clear(config)
-        # Reset thread ID to create a new conversation thread
-        st.session_state.thread_id = str(uuid.uuid4())
-        st.sidebar.success("Chat history cleared.")
+        if memory is not None:
+            memory.clear(config)
+            # Reset thread ID to create a new conversation thread
+            st.session_state.thread_id = str(uuid.uuid4())
+            st.sidebar.success("Chat history cleared.")
+        else:
+            st.sidebar.error("Memory not initialized. Please refresh the page.")
     except Exception as e:
         st.sidebar.error(f"Error clearing chat history: {e}")
 
@@ -477,9 +520,17 @@ st.write(
 
 # Accept user input
 if prompt := st.chat_input("What would you like to know?"):
-    # Display user message
-    with st.chat_message("user"):
-        st.markdown(prompt)
+    # Initialize messages in session state if not exists
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    
+    # Add user message to session state
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    
+    # Display all messages in the chat
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
     
     # Display assistant response
     with st.chat_message("assistant"):
@@ -506,6 +557,9 @@ if prompt := st.chat_input("What would you like to know?"):
             # Invoke the graph
             result = graph.invoke(initial_state, config=config)
             
+            # Add assistant response to session state
+            st.session_state.messages.append({"role": "assistant", "content": result["answer"]})
+            
             # Display document metadata if available
             if result.get("doc_metadata"):
                 doc_metadata = result["doc_metadata"]
@@ -530,4 +584,6 @@ if prompt := st.chat_input("What would you like to know?"):
                 st.caption(f"Last query retrieved {retrieved_count} document{'s' if retrieved_count != 1 else ''} from the knowledge base.")
                 
         except Exception as e:
-            st.error(f"Error processing request: {e}")
+            error_message = f"Error processing request: {e}"
+            st.error(error_message)
+            st.session_state.messages.append({"role": "assistant", "content": error_message})

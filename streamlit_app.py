@@ -1,27 +1,26 @@
 import streamlit as st
-from openai import OpenAI
 import os
 from langchain.chat_models import ChatOpenAI
 from langchain import hub
 from langchain.docstore.document import Document
 from langsmith import traceable, Client
 from typing_extensions import List, TypedDict, Optional, Dict, Any, Sequence, Annotated
-from langgraph.graph import START, StateGraph, MessagesState
+from langgraph.graph import START, StateGraph
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph.message import add_messages
 from langchain_openai import OpenAIEmbeddings
 from langchain_pinecone import PineconeVectorStore
-from langchain.memory import ConversationBufferMemory
 from langchain.schema import AIMessage, HumanMessage, SystemMessage, BaseMessage
 from langchain.callbacks.base import BaseCallbackHandler
-import time
 import pinecone
-import json
 import uuid
 import atexit
 
 # Global memory variable
 memory = None
+
+# Initialize LangSmith client for feedback
+langsmith_client = Client()
 
 # Session management
 def clear_session_memory():
@@ -35,6 +34,94 @@ def clear_session_memory():
 
 # Register cleanup function
 atexit.register(clear_session_memory)
+
+def submit_feedback(trace_id: str, score: int, comment: str = ""):
+    """Submit user feedback to LangSmith"""
+    try:
+        print(f"DEBUG: Submitting feedback: trace_id={trace_id}, score={score}, comment={comment}")
+        
+        # Validate trace_id
+        if not trace_id or trace_id == "None":
+            print(f"ERROR: Invalid trace_id: {trace_id}")
+            st.error("Cannot submit feedback: No trace ID available")
+            return False
+        
+        # Create feedback in LangSmith
+        feedback_response = langsmith_client.create_feedback(
+            run_id=trace_id,
+            key="user_feedback",
+            score=score,
+            comment=comment
+        )
+        
+        print(f"SUCCESS: Feedback submitted successfully for trace_id: {trace_id}")
+        print(f"DEBUG: LangSmith response: {feedback_response}")
+        
+        return True
+        
+    except Exception as e:
+        print(f"ERROR: Failed to submit feedback: {e}")
+        print(f"DEBUG: trace_id type: {type(trace_id)}, value: {repr(trace_id)}")
+        st.error(f"Failed to submit feedback: {str(e)}")
+        return False
+
+def display_feedback_buttons(trace_id: str, message_index: int):
+    """Display thumbs up/down feedback buttons for a message."""
+    print(f"DEBUG: display_feedback_buttons called - trace_id={trace_id}, message_index={message_index}")
+    
+    feedback_key = f"feedback_{message_index}_{trace_id}"
+    
+    # Initialize feedback state
+    if feedback_key not in st.session_state:
+        st.session_state[feedback_key] = None
+
+    col1, col2, col3 = st.columns([1, 1, 8])
+
+    # Show feedback buttons or status
+    if st.session_state[feedback_key] is None:
+        st.markdown("---")
+        st.markdown("**Was this response helpful?**")
+        
+        col_btn1, col_btn2, col_spacer = st.columns([1, 1, 6])
+        with col_btn1:
+            if st.button("👍 Helpful", key=f"up_{message_index}_{trace_id}", 
+                        use_container_width=True, type="secondary"):
+                # Submit feedback immediately
+                print(f"DEBUG: Thumbs up clicked - trace_id={trace_id}, message_index={message_index}")
+                if submit_feedback(trace_id, 1, "User found this response helpful"):
+                    st.session_state[feedback_key] = "positive"
+                    print(f"DEBUG: Feedback submission successful!")
+                    st.rerun()  # Rerun to show feedback status immediately
+                else:
+                    print(f"DEBUG: Feedback submission failed!")
+        
+        with col_btn2:
+            if st.button("👎 Not helpful", key=f"down_{message_index}_{trace_id}", 
+                        use_container_width=True, type="secondary"):
+                # Submit feedback immediately
+                print(f"DEBUG: Thumbs down clicked - trace_id={trace_id}, message_index={message_index}")
+                if submit_feedback(trace_id, 0, "User found this response not helpful"):
+                    st.session_state[feedback_key] = "negative"
+                    print(f"DEBUG: Feedback submission successful!")
+                    st.rerun()  # Rerun to show feedback status immediately
+                else:
+                    print(f"DEBUG: Feedback submission failed!")
+    else:
+        # Show compact feedback status
+        st.markdown("---")
+        feedback_col1, feedback_col2 = st.columns([1, 4])
+        
+        with feedback_col1:
+            if st.session_state[feedback_key] == "positive":
+                st.markdown("👍")
+            elif st.session_state[feedback_key] == "negative":
+                st.markdown("👎")
+        
+        with feedback_col2:
+            if st.session_state[feedback_key] == "positive":
+                st.markdown("✅ **Marked as helpful** • Feedback sent to LangSmith")
+            elif st.session_state[feedback_key] == "negative":
+                st.markdown("✅ **Marked as not helpful** • Feedback sent to LangSmith")
 
 # Set page config first
 st.set_page_config(
@@ -59,7 +146,7 @@ os.environ["LANGSMITH_PROJECT"] = "pathways-ai-assistant"
 #Constants
 DEFAULT_PINECONE_INDEX = "segment-explorer-v1-0"
 EMBEDDING_MODEL = "text-embedding-3-large"
-DEFAULT_NUM_DOCS = 10  # Default number of documents to retrieve
+DEFAULT_NUM_DOCS = 15  # Default number of documents to retrieve
 
 
 class StreamHandler(BaseCallbackHandler):
@@ -84,6 +171,7 @@ class ChatState(TypedDict):
     selected_index: str
     num_docs: int
     selected_prompt: Optional[Dict[str, str]]
+    trace_id: Optional[str]
 
 
 def get_available_indexes():
@@ -285,7 +373,7 @@ def generate(state: ChatState):
         # Format context from retrieved documents
         context_content = "\n\n".join(doc.page_content for doc in state["context"]) if state["context"] else ""
         
-        # Format the prompt with context and question
+        # Format the prompt with just context and question
         formatted_prompt = current_prompt.format(
             context=context_content,
             question=current_question.content
@@ -301,11 +389,28 @@ def generate(state: ChatState):
         # Generate response
         response = llm.invoke(messages)
         
-        # Return updated state with the new response
+        # Get the current trace ID from LangSmith context
+        trace_id = None
+        try:
+            # Try to get the trace ID from the LangSmith context
+            from langsmith.run_helpers import get_current_run_tree
+            current_run = get_current_run_tree()
+            if current_run and hasattr(current_run, 'trace_id'):
+                trace_id = str(current_run.trace_id)
+                print(f"DEBUG: Captured trace_id from LangSmith: {trace_id}")
+            else:
+                print("DEBUG: No current run tree found, trace_id will be None")
+        except Exception as e:
+            print(f"DEBUG: Error getting trace_id from LangSmith: {e}")
+        
+        # Note: We don't generate a fallback UUID here since that won't be valid in LangSmith
+        
+        # Return updated state with the new response and trace ID
         return {
             **state,
             "messages": state["messages"] + [response],
-            "answer": response.content
+            "answer": response.content,
+            "trace_id": trace_id
         }
         
     except Exception as e:
@@ -518,19 +623,27 @@ st.write(
     "Ask me questions about Senegal Segmentation Data and the Pathways Methodology."
 )
 
+# Initialize messages in session state if not exists
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# Display all existing messages in the chat
+for i, message in enumerate(st.session_state.messages):
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+        
+        # Display feedback buttons for assistant messages
+        if message["role"] == "assistant" and "trace_id" in message:
+            display_feedback_buttons(message["trace_id"], i)
+
 # Accept user input
 if prompt := st.chat_input("What would you like to know?"):
-    # Initialize messages in session state if not exists
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    
     # Add user message to session state
     st.session_state.messages.append({"role": "user", "content": prompt})
     
-    # Display all messages in the chat
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+    # Display the new user message
+    with st.chat_message("user"):
+        st.markdown(prompt)
     
     # Display assistant response
     with st.chat_message("assistant"):
@@ -551,31 +664,84 @@ if prompt := st.chat_input("What would you like to know?"):
                 "last_retrieval_count": current_state.values.get("last_retrieval_count") if current_state and hasattr(current_state, 'values') else None,
                 "selected_index": st.session_state.selected_index,
                 "num_docs": st.session_state.num_docs,
-                "selected_prompt": st.session_state.selected_prompt
+                "selected_prompt": st.session_state.selected_prompt,
+                "trace_id": current_state.values.get("trace_id") if current_state and hasattr(current_state, 'values') else None
             }
             
-            # Invoke the graph
+            # Invoke the graph and capture trace ID
             result = graph.invoke(initial_state, config=config)
             
-            # Add assistant response to session state
-            st.session_state.messages.append({"role": "assistant", "content": result["answer"]})
+            # Get the trace ID from the result
+            trace_id = result.get("trace_id")
+            if not trace_id:
+                # Fallback: generate a unique ID for this interaction
+                trace_id = str(uuid.uuid4())
             
-            # Display document metadata if available
-            if result.get("doc_metadata"):
+            # Add assistant response to session state with trace ID
+            assistant_message = {
+                "role": "assistant", 
+                "content": result["answer"],
+                "trace_id": trace_id
+            }
+            st.session_state.messages.append(assistant_message)
+            
+            # Display feedback buttons for this new response
+            current_message_index = len(st.session_state.messages) - 1
+            display_feedback_buttons(trace_id, current_message_index)
+            
+            # Display source documents with improved preview
+            if result.get("context") and result.get("doc_metadata"):
+                context_docs = result["context"]
                 doc_metadata = result["doc_metadata"]
-                with st.expander(f"📚 Source Documents ({len(doc_metadata)})"):
-                    for i, doc_meta in enumerate(doc_metadata):
+                
+                with st.expander(f"📚 Source Documents ({len(context_docs)})"):
+                    for i, (doc, meta) in enumerate(zip(context_docs, doc_metadata)):
                         doc_num = i + 1
-                        st.markdown(f"**Document {doc_num}:**")
-                        if 'content_preview' in doc_meta:
-                            st.markdown(f"*Preview:* {doc_meta['content_preview']}")
-                            display_meta = {k: v for k, v in doc_meta.items() if k != 'content_preview'}
+                        
+                        # Create a more readable preview
+                        content = doc.page_content
+                        preview_length = 300
+                        
+                        if len(content) > preview_length:
+                            preview = content[:preview_length] + "..."
                         else:
-                            display_meta = doc_meta
-                        if display_meta:
-                            for key, value in display_meta.items():
-                                st.markdown(f"*{key}:* {value}")
-                        if i < len(doc_metadata) - 1:
+                            preview = content
+                        
+                        # Display document with better formatting
+                        col1, col2 = st.columns([3, 1])
+                        
+                        with col1:
+                            st.markdown(f"**📄 Document {doc_num}**")
+                            st.markdown(f'<div style="background-color: #f0f2f6; padding: 10px; border-radius: 5px; font-size: 14px; line-height: 1.4;">{preview}</div>', 
+                                      unsafe_allow_html=True)
+                        
+                        with col2:
+                            # Show only the most relevant metadata
+                            relevant_meta = {}
+                            
+                            # Extract useful metadata (customize based on your data)
+                            for key, value in meta.items():
+                                if key in ['source', 'title', 'page', 'section', 'filename', 'chapter']:
+                                    relevant_meta[key] = value
+                                elif key.lower() in ['url', 'date', 'author']:
+                                    relevant_meta[key] = value
+                            
+                            if relevant_meta:
+                                st.markdown("**Source Info:**")
+                                for key, value in relevant_meta.items():
+                                    if value:  # Only show if value exists
+                                        st.caption(f"**{key.title()}:** {value}")
+                            
+                            # Add a button to view full content
+                            if st.button(f"View Full Text", key=f"full_doc_{i}"):
+                                st.text_area(
+                                    f"Full Content - Document {doc_num}",
+                                    value=content,
+                                    height=200,
+                                    key=f"full_content_{i}"
+                                )
+                        
+                        if i < len(context_docs) - 1:
                             st.markdown("---")
             
             # Show retrieval information if available
